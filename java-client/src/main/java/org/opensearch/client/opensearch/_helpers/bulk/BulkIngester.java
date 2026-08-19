@@ -114,9 +114,10 @@ public class BulkIngester<Context> implements AutoCloseable {
     private final @Nullable BulkRequest globalSettings;
     private final int maxRequests;
     private final long maxSize;
-    private final int maxOperations;
+    private volatile int maxOperations;
     private final @Nullable BulkListener<Context> listener;
     private final Long flushIntervalMillis;
+    private final @Nullable AdaptiveOperationsController adaptiveController;
 
     private @Nullable ScheduledFuture<?> flushTask;
     private @Nullable ScheduledExecutorService scheduler;
@@ -162,6 +163,7 @@ public class BulkIngester<Context> implements AutoCloseable {
         this.listener = builder.listener;
         this.backoffPolicy = builder.backoffPolicy;
         this.flushIntervalMillis = builder.flushIntervalMillis;
+        this.adaptiveController = builder.adaptiveController;
 
         if (flushIntervalMillis != null || listener != null) {
             // Create a scheduler if needed
@@ -202,9 +204,20 @@ public class BulkIngester<Context> implements AutoCloseable {
 
     /**
      * The configured max operations to buffer in a single bulk request.
+     * When adaptive control is enabled this value changes at runtime.
      */
     public int maxOperations() {
         return this.maxOperations;
+    }
+
+    /**
+     * Returns the adaptive operations controller, or {@code null} if adaptive control is disabled.
+     *
+     * @see Builder#adaptiveOperations(AdaptiveOperationsController)
+     */
+    @Nullable
+    public AdaptiveOperationsController adaptiveController() {
+        return this.adaptiveController;
     }
 
     /**
@@ -478,6 +491,16 @@ public class BulkIngester<Context> implements AutoCloseable {
 
                 sendRequestCondition.signalIfReadyAfter(() -> {
                     requestsInFlightCount--;
+
+                    // Adaptive maxOperations — update under the existing lock
+                    if (adaptiveController != null) {
+                        boolean has429 = resp != null && resp.items().stream()
+                            .anyMatch(i -> i.error() != null && i.status() == 429);
+                        int batchSize = exec.request != null ? exec.request.operations().size() : 0;
+                        long tookMs = resp != null ? resp.took() : -1;
+                        maxOperations = adaptiveController.observe(batchSize, tookMs, has429, thr != null);
+                    }
+
                     closeCondition.signalAllIfReady();
                 });
                 return null;
@@ -684,11 +707,12 @@ public class BulkIngester<Context> implements AutoCloseable {
         private BulkRequest globalSettings;
         private int bulkOperations = 1000;
         private long bulkSize = 5 * 1024 * 1024;
-        private int maxConcurrentRequests = 1;
+        private int maxConcurrentRequests = Runtime.getRuntime().availableProcessors();
         private Long flushIntervalMillis;
         private BulkListener<Context> listener;
         private ScheduledExecutorService scheduler;
         private BackoffPolicy backoffPolicy;
+        private @Nullable AdaptiveOperationsController adaptiveController;
 
         public Builder<Context> client(OpenSearchAsyncClient client) {
             this.client = client;
@@ -735,8 +759,8 @@ public class BulkIngester<Context> implements AutoCloseable {
 
         /**
          * Sets the number of concurrent requests allowed to be executed. A value of 1 means 1 request is
-         * allowed to be executed
-         * while accumulating new bulk requests. Defaults to {@code 1}.
+         * allowed to be executed while accumulating new bulk requests. Defaults to
+         * {@code Runtime.getRuntime().availableProcessors()}.
          *
          * @throws IllegalArgumentException if less than 1.
          */
@@ -805,6 +829,30 @@ public class BulkIngester<Context> implements AutoCloseable {
          */
         public Builder<Context> globalSettings(Function<BulkRequest.Builder, BulkRequest.Builder> fn) {
             return globalSettings(fn.apply(new BulkRequest.Builder()));
+        }
+
+        /**
+         * Enables adaptive {@code maxOperations} tuning. The provided controller observes
+         * server-side latency after every bulk response and adjusts {@code maxOperations}
+         * automatically using hill climbing (increase) and AIMD (decrease on overload).
+         * <p>
+         * When enabled, {@link #maxOperations} sets the <em>initial</em> value only; the
+         * controller takes over from the first response onward.
+         * <p>
+         * Example — start at 200 ops, let the controller find the optimum automatically:
+         * <pre>{@code
+         * BulkIngester.of(b -> b
+         *     .client(client)
+         *     .maxOperations(200)
+         *     .adaptiveOperations(new AdaptiveOperationsController(200))
+         * );
+         * }</pre>
+         *
+         * @param controller the adaptive controller to use; pass {@code null} to disable
+         */
+        public Builder<Context> adaptiveOperations(@Nullable AdaptiveOperationsController controller) {
+            this.adaptiveController = controller;
+            return this;
         }
 
         @Override
